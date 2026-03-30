@@ -1,0 +1,8 @@
+[
+  {"pattern": "Architecture/", "category": "architecture"},
+  {"pattern": "Strategy/", "category": "strategy"},
+  {"pattern": "Research/", "category": "research"},
+  {"pattern": "Legal/", "category": "legal"},
+  {"pattern": "Meeting_Notes/", "category": "meetings"},
+  {"pattern": "Product/", "category": "product"}
+]

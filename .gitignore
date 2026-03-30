@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+.mypy_cache/
+.pytest_cache/
+
+# Credentials (never commit)
+*.enc
+.env
+.env.*
+client_secret.json
+
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Node
+node_modules/
