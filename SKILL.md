@@ -1,5 +1,5 @@
 ---
-name: gws-drive-backup
+name: gws-to-gh-kb
 description: Download and back up Google Drive files locally via the gws CLI with format conversion and AI-readable output. Google Docs to Markdown (with image extraction), Google Sheets to CSV per tab plus XLSX, Google Slides to PPTX. Also converts downloaded .docx to Markdown and .xlsx to CSV per tab for AI readability. Supports personal Drive, shared drives, and folder structures. Use when (1) user asks to back up, download, copy, sync, or mirror Google Drive files locally, (2) user asks to export or convert Google Docs, Sheets, Slides, .docx, or .xlsx to AI-readable formats, (3) user wants offline access to Drive content, (4) user mentions drive backup, download from Drive, export Drive, or copy Drive files.
 ---
 

@@ -1,4 +1,4 @@
-# gws-drive-backup
+# gws-to-gh-kb
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -26,7 +26,7 @@ gws drive files list --params '{"pageSize": 1}'
 Copy the skill into your Claude Code skills directory:
 
 ```bash
-cp -r gws-drive-backup ~/.claude/skills/gws-drive-backup
+cp -r gws-to-gh-kb ~/.claude/skills/gws-to-gh-kb
 ```
 
 Claude Code will automatically discover the skill from `SKILL.md`.
@@ -43,7 +43,7 @@ cp examples/skip_patterns.example.json ~/gws_backup/kb/skip_patterns.json
 # Edit both files to match your Drive folder structure
 
 # 3. Run the full sync pipeline
-bash ~/.claude/skills/gws-drive-backup/scripts/sync_kb.sh ~/gws_backup ~/gws_backup/kb
+bash ~/.claude/skills/gws-to-gh-kb/scripts/sync_kb.sh ~/gws_backup ~/gws_backup/kb
 
 # 4. Initialise the KB as a Git repository
 cd ~/gws_backup/kb && git init && git add -A && git commit -m "Initial KB sync"
