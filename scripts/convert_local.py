@@ -51,6 +51,10 @@ def convert_docx(docx_path):
     with open(md_path, "w") as f:
         f.write(result.stdout)
 
+    sanitize_script = os.path.join(os.path.dirname(__file__), "sanitize_markdown.py")
+    if os.path.exists(sanitize_script):
+        subprocess.run([sys.executable, sanitize_script, md_path], check=False)
+
     # Check if any images were extracted
     media_dir = os.path.join(images_dir, "media")
     img_count = 0

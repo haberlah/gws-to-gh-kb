@@ -104,6 +104,8 @@ python3 <skill_dir>/scripts/populate_kb.py <backup_dir> <kb_dir> \
   --mapping <kb_dir>/category_mapping.json \
   --skip <kb_dir>/skip_patterns.json \
   --metadata <backup_dir>/drive_metadata.json
+python3 <skill_dir>/scripts/build_index.py <kb_dir>
+python3 <skill_dir>/scripts/validate_kb.py <kb_dir>
 ```
 
 **Required flags:**
@@ -134,7 +136,7 @@ Each rule is a regex tested against the file's relative path. First match wins. 
 - `category`, `tags`, `doc_type` (derived from repo path and filename)
 - `word_count`, `has_images`, `sensitivity` (computed locally)
 
-### Phase 5 — Generate index and sync (`sync_kb.sh`)
+### Phase 5 — Validate and sync (`sync_kb.sh`)
 
 Orchestrates all phases end-to-end and creates a GitHub PR:
 
@@ -146,7 +148,19 @@ Defaults to `~/gws_backup` and `~/gws_backup/kb` if no args provided. Automatica
 
 Add `--include-personal` to include personal Drive files (shared drives only by default).
 
-Generates `index.json` via `build_index.py` for programmatic catalogue access.
+Generates `index.json` via `build_index.py` for programmatic catalogue access, then runs `validate_kb.py` before opening the PR.
+
+## Review-Learned Guardrails
+
+The scripts now guard against issues found during KB PR review:
+
+- Google Docs markdown exports with MIME multipart wrappers such as `--gws_boundary`.
+- Duplicate markdown artifacts such as `README.md.md`.
+- Google Docs whose titles already end in `.md` are exported as a single `.md` file.
+- Folder metadata being assigned as document provenance in YAML frontmatter.
+- Stage 2 feature-validation closing rows regressing to `0:05`.
+
+`validate_kb.py` blocks hard corruption by default and reports broader provenance issues as warnings. Use `--strict` for a dedicated provenance cleanup pass.
 
 ## Manual export commands
 

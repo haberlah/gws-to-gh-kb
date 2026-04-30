@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -41,32 +42,151 @@ if "--mapping" in sys.argv:
     MAPPING_FILE = Path(sys.argv[idx + 1]).resolve()
 
 # Load Drive metadata (optional — frontmatter will have empty fields if missing)
+def load_metadata_file(path):
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("files", [])
+
 if META_FILE.exists():
-    with open(META_FILE) as f:
-        drive_meta = json.load(f).get("files", [])
+    metadata_files = [META_FILE]
+else:
+    metadata_files = [
+        p for p in sorted(SRC.rglob("drive_metadata.json"))
+        if DST not in p.parents
+    ]
+
+drive_meta = []
+if metadata_files:
+    for path in metadata_files:
+        try:
+            loaded = load_metadata_file(path)
+            drive_meta.extend(loaded)
+            print(f"Loaded {len(loaded)} metadata entries from {path}")
+        except Exception as exc:
+            print(f"WARNING: Could not load metadata from {path}: {exc}")
 else:
     print(f"WARNING: Metadata file not found at {META_FILE}. Frontmatter will have empty Drive fields.")
     print(f"  Run Phase 0 (gws drive files list) first to generate drive_metadata.json")
-    drive_meta = []
 
-# Build name → metadata lookup (fuzzy: strip extensions, normalise)
+# Build metadata lookups
+KNOWN_EXTENSIONS = {'.md', '.docx', '.csv', '.xlsx', '.pdf', '.pptx', '.txt', '.tsv', '.zip', '.png', '.jpg'}
+FOLDER_MIME = 'application/vnd.google-apps.folder'
+
 def normalise(name):
-    return re.sub(r'[^a-z0-9]', '', name.lower().split('.')[0])
+    """Normalise a filename for fuzzy matching. Preserves word boundaries."""
+    lower = name.lower()
+    for ext in sorted(KNOWN_EXTENSIONS, key=len, reverse=True):
+        if lower.endswith(ext):
+            lower = lower[:len(lower) - len(ext)]
+            break
+    # Convert separators to space to preserve word boundaries
+    lower = re.sub(r'[/:*?"<>|_\-\s\u2014\u2013]+', ' ', lower).strip()
+    return re.sub(r'[^a-z0-9 ]', '', lower).strip()
 
-meta_lookup = {}
+# Primary: ID-based lookup
+meta_by_id = {m["id"]: m for m in drive_meta if m.get("id")}
+
+# Secondary: name-based lookup (lists to handle collisions)
+meta_by_name = {}
 for m in drive_meta:
     key = normalise(m["name"])
-    meta_lookup[key] = m
+    meta_by_name.setdefault(key, []).append(m)
 
-def find_meta(filename):
-    """Find Drive metadata for a local filename."""
+# Tertiary: manifest-based mapping (local relative path → Drive ID)
+manifest_lookup = {}
+manifest_name_lookup = {}
+for mroot, _, mfiles in os.walk(SRC):
+    if "file_manifest.json" in mfiles:
+        try:
+            manifest_dir = Path(mroot)
+            manifest_rel_dir = manifest_dir.relative_to(SRC)
+            with open(os.path.join(mroot, "file_manifest.json")) as mf:
+                for entry in json.load(mf):
+                    local = entry.get("local")
+                    fid = entry.get("id")
+                    if not local or not fid:
+                        continue
+                    rel_key = str(manifest_rel_dir / local)
+                    manifest_lookup[rel_key] = fid
+                    manifest_name_lookup.setdefault(local, set()).add(fid)
+        except Exception:
+            pass
+
+if manifest_lookup:
+    print(f"Loaded {len(manifest_lookup)} manifest path entries for ID-based lookup")
+else:
+    print("No file manifests found — falling back to name-based metadata lookup")
+
+def compatible_meta(meta, filename):
+    """Return True when Drive metadata can plausibly describe a local file."""
+    mime = meta.get('mimeType', '')
+    if mime == FOLDER_MIME:
+        return False
+
+    ext = Path(filename).suffix.lower()
+    if ext == '.md':
+        return mime in {
+            'application/vnd.google-apps.document',
+            'text/markdown',
+            'text/plain',
+            'application/octet-stream',
+        } or 'wordprocessingml.document' in mime
+    if ext == '.csv':
+        return 'spreadsheet' in mime or mime in {'text/csv', 'text/plain'}
+    if ext == '.pdf':
+        return mime == 'application/pdf'
+    if ext in {'.txt', '.tsv'}:
+        return mime.startswith('text/')
+    return True
+
+def find_meta(rel_path, filename=None):
+    """Find Drive metadata. Priority: manifest path > unique manifest name > exact name > fuzzy name."""
+    filename = filename or Path(rel_path).name
+    rel_key = str(rel_path)
+
+    # 1. Manifest: local relative path → Drive ID → metadata
+    if rel_key in manifest_lookup:
+        fid = manifest_lookup[rel_key]
+        meta = meta_by_id.get(fid)
+        if meta and compatible_meta(meta, filename):
+            return meta
+
+    # 2. Manifest: unambiguous local filename → Drive ID → metadata
+    if filename in manifest_name_lookup and len(manifest_name_lookup[filename]) == 1:
+        fid = next(iter(manifest_name_lookup[filename]))
+        meta = meta_by_id.get(fid)
+        if meta and compatible_meta(meta, filename):
+            return meta
+
+    # 3. Normalised name (exact match)
     key = normalise(filename)
-    if key in meta_lookup:
-        return meta_lookup[key]
-    # Try partial match
-    for k, v in meta_lookup.items():
-        if key[:20] in k or k[:20] in key:
-            return v
+    if key in meta_by_name:
+        candidates = [c for c in meta_by_name[key] if c.get('mimeType') != FOLDER_MIME]
+        compatible = [c for c in candidates if compatible_meta(c, filename)]
+        if len(compatible) == 1:
+            return compatible[0]
+        if compatible:
+            candidates = compatible
+        if len(candidates) == 1:
+            return candidates[0]
+        # Disambiguate by MIME type
+        ext = Path(filename).suffix.lower()
+        for c in candidates:
+            if ext == '.md' and c.get('mimeType') == 'application/vnd.google-apps.document':
+                return c
+            if ext == '.csv' and 'spreadsheet' in c.get('mimeType', ''):
+                return c
+        return candidates[0]
+
+    # 4. Fuzzy prefix (last resort, longer prefix than before)
+    if len(key) >= 15:
+        for k, v_list in meta_by_name.items():
+            if len(k) < 15:
+                continue
+            candidates = [c for c in v_list if compatible_meta(c, filename)]
+            if candidates and (key[:30] in k or k[:30] in key):
+                return candidates[0]
+
     return None
 
 def sanitise(name):
@@ -130,18 +250,6 @@ def should_include(path, name):
         return False  # Handle separately via image references
     return False
 
-def get_sensitivity(category, filename):
-    """Auto-assign sensitivity from path/category."""
-    if category and category.startswith('contacts'):
-        return 'confidential'
-    if category and category.startswith('legal'):
-        return 'confidential'
-    if 'transcript' in filename.lower():
-        return 'confidential'
-    if 'website' in filename.lower() and category and 'comms' in category:
-        return 'public'
-    return 'internal'
-
 def get_doc_type(category, filename):
     """Infer document type."""
     if category and 'template' in category:
@@ -201,6 +309,36 @@ def get_tags(filename, category):
 
     return sorted(tags) if tags else ['general']
 
+def extract_provenance(filepath):
+    """Extract Drive provenance from existing YAML frontmatter as fallback."""
+    try:
+        with open(filepath, 'r', errors='replace') as f:
+            content = f.read()
+        if not content.startswith('---\n'):
+            return None
+        end = content.find('\n---\n', 4)
+        if end < 0:
+            return None
+        result = {}
+        for line in content[4:end].split('\n'):
+            if ': ' not in line:
+                continue
+            key, val = line.split(': ', 1)
+            val = val.strip().strip('"')
+            if not val:
+                continue
+            if key.strip() == 'google_doc_id':
+                result['id'] = val
+            elif key.strip() == 'google_doc_url':
+                result['webViewLink'] = val
+            elif key.strip() == 'last_modified':
+                result['modifiedTime'] = val
+            elif key.strip() == 'last_modified_by':
+                result['lastModifyingUser'] = val
+        return result if result else None
+    except Exception:
+        return None
+
 def inject_frontmatter(filepath, meta, category, source_drive):
     """Read an .md file, prepend YAML frontmatter."""
     with open(filepath, 'r', errors='replace') as f:
@@ -238,7 +376,6 @@ def inject_frontmatter(filepath, meta, category, source_drive):
     word_count = len(content.split())
     has_images = bool(re.search(r'!\[', content))
     filename = os.path.basename(filepath)
-    sensitivity = get_sensitivity(category, filename)
     doc_type = get_doc_type(category, filename)
     tags = get_tags(filename, category)
 
@@ -263,12 +400,17 @@ tags: [{', '.join(tags)}]
 doc_type: {doc_type}
 word_count: {word_count}
 has_images: {str(has_images).lower()}
-sensitivity: {sensitivity}
 ---
 
 """
     with open(filepath, 'w') as f:
         f.write(fm + content)
+
+def normalise_markdown(filepath):
+    """Run local markdown export normalization if the helper is available."""
+    script = Path(__file__).with_name("sanitize_markdown.py")
+    if script.exists():
+        subprocess.run([sys.executable, str(script), str(filepath)], check=False)
 
 # Track referenced images
 referenced_images = set()
@@ -351,19 +493,32 @@ for src_base in src_bases:
             safe_name = sanitise(fname)
             if ext == '.txt':
                 safe_name = safe_name.rsplit('.', 1)[0] + '.md'
+            if safe_name.lower().endswith('.md.md'):
+                print(f"  WARN: Skipping duplicate markdown export name {rel_path}")
+                skipped += 1
+                continue
 
             # Build destination path
             dst_path = DST / category / safe_name
             dst_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # On re-sync, overwrite existing files with fresh copy from Drive
+            # On re-sync, preserve existing provenance before overwriting
+            existing_provenance = None
+            if dst_path.exists() and dst_path.suffix == '.md':
+                existing_provenance = extract_provenance(str(dst_path))
 
             shutil.copy2(src_path, dst_path)
             source_drive = get_source_drive(rel_path)
 
             # Inject frontmatter for .md files (and converted .txt)
             if dst_path.suffix == '.md':
-                meta = find_meta(fname)
+                normalise_markdown(dst_path)
+                meta = find_meta(rel_path, fname)
+                if meta is None and existing_provenance:
+                    print(f"  WARN: No metadata for {fname} — preserving existing provenance")
+                    meta = existing_provenance
+                elif meta is None:
+                    print(f"  WARN: No metadata for {fname} — frontmatter will have empty provenance")
                 inject_frontmatter(str(dst_path), meta, category, source_drive)
 
             copied += 1

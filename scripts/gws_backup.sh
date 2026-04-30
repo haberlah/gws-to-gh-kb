@@ -54,15 +54,35 @@ echo "Scope:  $SCOPE"
 [ -n "$DRIVE_ID" ] && echo "Drive:  $DRIVE_ID"
 echo ""
 
-# List all files
-FILES_JSON=$(gws drive files list --params "{\"q\": \"${QUERY}\", \"pageSize\": 1000, \"fields\": \"files(id,name,mimeType,parents)\"${EXTRA_PARAMS}}" 2>/dev/null)
+# List all files (paginated)
+FILES_JSON=$(gws drive files list --params "{\"q\": \"${QUERY}\", \"pageSize\": 500, \"fields\": \"files(id,name,mimeType,parents),nextPageToken\"${EXTRA_PARAMS}}" \
+  --page-all --page-limit 50 --page-delay 200 2>/dev/null \
+  | jq -s '{files: [.[].files[]]}')
 TOTAL=$(echo "$FILES_JSON" | jq '.files | length')
 echo "Found $TOTAL files"
 echo ""
 
+# Initialise file manifest (maps local filenames to Drive IDs)
+MANIFEST_NDJSON="$OUTPUT_DIR/.file_manifest.ndjson"
+: > "$MANIFEST_NDJSON"
+
 # Sanitise a filename for local filesystem
 sanitise() {
   echo "$1" | sed 's/[/:*?"<>|]/_/g; s/ /_/g; s/—/-/g'
+}
+
+strip_known_ext() {
+  local name="$1"
+  shift
+  local lower="${name,,}"
+  local ext
+  for ext in "$@"; do
+    if [[ "$lower" == *".${ext}" ]]; then
+      echo "${name:0:${#name}-${#ext}-1}"
+      return
+    fi
+  done
+  echo "$name"
 }
 
 # Process each file
@@ -77,38 +97,43 @@ echo "$FILES_JSON" | jq -c '.files[]' | while IFS= read -r file; do
     # ── Google Docs → Markdown (+ docx if images present) ──
     application/vnd.google-apps.document)
       echo "DOC: $NAME"
+      SAFE_STEM=$(strip_known_ext "$SAFE_NAME" md markdown docx txt)
 
       # Export as markdown
       cd "$OUTPUT_DIR"
       gws drive files export --params "{\"fileId\": \"$ID\", \"mimeType\": \"text/markdown\"}" >/dev/null 2>&1
-      [ -f download.bin ] && mv download.bin "${SAFE_NAME}.md"
-      echo "  → ${SAFE_NAME}.md"
+      [ -f download.bin ] && mv download.bin "${SAFE_STEM}.md"
+      python3 "$SCRIPT_DIR/sanitize_markdown.py" "${OUTPUT_DIR}/${SAFE_STEM}.md" >/dev/null 2>&1 || true
+      echo "{\"local\":\"${SAFE_STEM}.md\",\"id\":\"$ID\"}" >> "$MANIFEST_NDJSON"
+      echo "  → ${SAFE_STEM}.md"
 
       # Extract base64 images from markdown to separate files + rewrite paths
-      python3 "$SCRIPT_DIR/extract_images.py" "${OUTPUT_DIR}/${SAFE_NAME}.md" 2>/dev/null || true
+      python3 "$SCRIPT_DIR/extract_images.py" "${OUTPUT_DIR}/${SAFE_STEM}.md" 2>/dev/null || true
 
       # Also export as .docx if images were found (docx embeds images natively)
       if [ -d "${OUTPUT_DIR}/images" ] && [ "$(ls -A "${OUTPUT_DIR}/images" 2>/dev/null)" ]; then
         echo "  Images found — also exporting as .docx"
         gws drive files export --params "{\"fileId\": \"$ID\", \"mimeType\": \"application/vnd.openxmlformats-officedocument.wordprocessingml.document\"}" >/dev/null 2>&1
         local_file=$(ls -t download.* 2>/dev/null | head -1)
-        [ -n "$local_file" ] && mv "$local_file" "${SAFE_NAME}.docx"
-        echo "  → ${SAFE_NAME}.docx"
+        [ -n "$local_file" ] && mv "$local_file" "${SAFE_STEM}.docx"
+        echo "  → ${SAFE_STEM}.docx"
       fi
       ;;
 
     # ── Google Sheets → CSV per tab + XLSX ──
     application/vnd.google-apps.spreadsheet)
       echo "SHEET: $NAME"
-      SHEET_DIR="$OUTPUT_DIR/${SAFE_NAME}"
+      SAFE_STEM=$(strip_known_ext "$SAFE_NAME" xlsx xls csv)
+      SHEET_DIR="$OUTPUT_DIR/${SAFE_STEM}"
       mkdir -p "$SHEET_DIR"
 
       # Full workbook as xlsx
       cd "$OUTPUT_DIR"
       gws drive files export --params "{\"fileId\": \"$ID\", \"mimeType\": \"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\"}" >/dev/null 2>&1
       local_file=$(ls -t download.* 2>/dev/null | head -1)
-      [ -n "$local_file" ] && mv "$local_file" "${SHEET_DIR}/${SAFE_NAME}.xlsx"
-      echo "  → ${SAFE_NAME}/${SAFE_NAME}.xlsx"
+      [ -n "$local_file" ] && mv "$local_file" "${SHEET_DIR}/${SAFE_STEM}.xlsx"
+      echo "{\"local\":\"${SAFE_STEM}\",\"id\":\"$ID\"}" >> "$MANIFEST_NDJSON"
+      echo "  → ${SAFE_STEM}/${SAFE_STEM}.xlsx"
 
       # Each tab as CSV
       TABS=$(gws sheets spreadsheets get --params "{\"spreadsheetId\": \"$ID\"}" 2>/dev/null \
@@ -118,7 +143,7 @@ echo "$FILES_JSON" | jq -c '.files[]' | while IFS= read -r file; do
           SAFE_TAB=$(sanitise "$tab")
           gws sheets spreadsheets values get --params "{\"spreadsheetId\": \"$ID\", \"range\": \"${tab}\"}" 2>/dev/null \
             | jq -r '.values[] | @csv' > "${SHEET_DIR}/${SAFE_TAB}.csv" 2>/dev/null
-          echo "  → ${SAFE_NAME}/${SAFE_TAB}.csv"
+          echo "  → ${SAFE_STEM}/${SAFE_TAB}.csv"
         done
       fi
       ;;
@@ -126,11 +151,13 @@ echo "$FILES_JSON" | jq -c '.files[]' | while IFS= read -r file; do
     # ── Google Slides → PPTX ──
     application/vnd.google-apps.presentation)
       echo "SLIDES: $NAME"
+      SAFE_STEM=$(strip_known_ext "$SAFE_NAME" pptx ppt)
       cd "$OUTPUT_DIR"
       gws drive files export --params "{\"fileId\": \"$ID\", \"mimeType\": \"application/vnd.openxmlformats-officedocument.presentationml.presentation\"}" >/dev/null 2>&1
       local_file=$(ls -t download.* 2>/dev/null | head -1)
-      [ -n "$local_file" ] && mv "$local_file" "${SAFE_NAME}.pptx"
-      echo "  → ${SAFE_NAME}.pptx"
+      [ -n "$local_file" ] && mv "$local_file" "${SAFE_STEM}.pptx"
+      echo "{\"local\":\"${SAFE_STEM}.pptx\",\"id\":\"$ID\"}" >> "$MANIFEST_NDJSON"
+      echo "  → ${SAFE_STEM}.pptx"
       ;;
 
     # ── Recurse into folders ──
@@ -145,8 +172,21 @@ echo "$FILES_JSON" | jq -c '.files[]' | while IFS= read -r file; do
       echo "FORM: $NAME (skipped — not exportable)"
       ;;
 
+    # ── Audio/video → skip (too large, not AI-readable) ──
+    audio/*|video/*|application/vnd.google-apps.audio|application/vnd.google-apps.video)
+      echo "SKIP (media): $NAME"
+      ;;
+
     # ── All other files → download as-is ──
     *)
+      # Also skip by file extension for non-Google MIME types
+      LOWER_NAME=$(echo "$NAME" | tr '[:upper:]' '[:lower:]')
+      case "$LOWER_NAME" in
+        *.mp4|*.mp3|*.m4a|*.wav|*.avi|*.mov|*.mkv|*.flac|*.ogg|*.webm|*.wmv|*.aac)
+          echo "SKIP (media): $NAME"
+          continue
+          ;;
+      esac
       echo "FILE: $NAME"
       cd "$OUTPUT_DIR"
       gws drive files get --params "{\"fileId\": \"$ID\", \"alt\": \"media\"}" >/dev/null 2>&1
@@ -158,11 +198,18 @@ echo "$FILES_JSON" | jq -c '.files[]' | while IFS= read -r file; do
           EXT="${local_file##*.}"
           mv "$local_file" "${SAFE_NAME}.${EXT}"
         fi
+        echo "{\"local\":\"${SAFE_NAME}\",\"id\":\"$ID\"}" >> "$MANIFEST_NDJSON"
         echo "  → ${SAFE_NAME}"
       fi
       ;;
   esac
 done
+
+# Merge manifest NDJSON into final JSON array
+if [ -s "$MANIFEST_NDJSON" ]; then
+  jq -s '.' "$MANIFEST_NDJSON" > "$OUTPUT_DIR/file_manifest.json"
+fi
+rm -f "$MANIFEST_NDJSON"
 
 echo ""
 echo "=== Backup complete ==="
